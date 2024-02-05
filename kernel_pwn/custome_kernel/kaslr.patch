@@ -1,0 +1,169 @@
+diff --git a/arch/x86/boot/compressed/error.c b/arch/x86/boot/compressed/error.c
+index 5313c5cb2b80..10ade1046819 100644
+--- a/arch/x86/boot/compressed/error.c
++++ b/arch/x86/boot/compressed/error.c
+@@ -23,6 +23,22 @@ void error(char *m)
+ 		asm("hlt");
+ }
+ 
++void log(const char *fmt, ...)
++{
++	static char buf[1024];
++	va_list args;
++	int len;
++
++	va_start(args, fmt);
++	len = vsnprintf(buf, sizeof(buf), fmt, args);
++	va_end(args);
++
++	if (len && buf[len - 1] == '\n')
++		buf[len - 1] = '\0';
++
++	warn(buf);
++}
++
+ /* EFI libstub  provides vsnprintf() */
+ #ifdef CONFIG_EFI_STUB
+ void panic(const char *fmt, ...)
+diff --git a/arch/x86/boot/compressed/error.h b/arch/x86/boot/compressed/error.h
+index 86fe33b93715..c347c8af9de1 100644
+--- a/arch/x86/boot/compressed/error.h
++++ b/arch/x86/boot/compressed/error.h
+@@ -6,6 +6,7 @@
+ 
+ void warn(char *m);
+ void error(char *m) __noreturn;
++void log(const char *fmt, ...);
+ void panic(const char *fmt, ...) __noreturn __cold;
+ 
+ #endif /* BOOT_COMPRESSED_ERROR_H */
+diff --git a/arch/x86/boot/compressed/kaslr.c b/arch/x86/boot/compressed/kaslr.c
+index 9193acf0e9cd..86b4253c73ba 100644
+--- a/arch/x86/boot/compressed/kaslr.c
++++ b/arch/x86/boot/compressed/kaslr.c
+@@ -830,7 +830,10 @@ static unsigned long find_random_virt_addr(unsigned long minimum,
+ 	 */
+ 	slots = 1 + (KERNEL_IMAGE_SIZE - minimum - image_size) / CONFIG_PHYSICAL_ALIGN;
+ 
+-	random_addr = kaslr_get_random_long("Virtual") % slots;
++	log("CONFIG_PHYSICAL_ALIGN: 0x%llx", CONFIG_PHYSICAL_ALIGN);
++	unsigned long tmp = kaslr_get_random_long("Virtual");
++	random_addr = tmp % slots;
++	log("tmp: 0x%llx slots: 0x%llx random_addr: 0x%llx\n", tmp, slots, random_addr);
+ 
+ 	return random_addr * CONFIG_PHYSICAL_ALIGN + minimum;
+ }
+@@ -873,6 +876,7 @@ void choose_random_location(unsigned long input,
+ 
+ 	/* Walk available memory entries to find a random address. */
+ 	random_addr = find_random_phys_addr(min_addr, output_size);
++	log("phy addr: %llx\n", random_addr);
+ 	if (!random_addr) {
+ 		warn("Physical KASLR disabled: no suitable memory region!");
+ 	} else {
+@@ -883,7 +887,9 @@ void choose_random_location(unsigned long input,
+ 
+ 
+ 	/* Pick random virtual address starting from LOAD_PHYSICAL_ADDR. */
++	log("LOAD_PHYSICAL_ADDR: 0x%llx", LOAD_PHYSICAL_ADDR);
+ 	if (IS_ENABLED(CONFIG_X86_64))
+ 		random_addr = find_random_virt_addr(LOAD_PHYSICAL_ADDR, output_size);
++	log("virt addr: %llx\n", random_addr);
+ 	*virt_addr = random_addr;
+ }
+diff --git a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
+index fd975a4a5200..6ec4f7e971a1 100644
+--- a/arch/x86/kernel/setup.c
++++ b/arch/x86/kernel/setup.c
+@@ -858,6 +858,7 @@ static void __init x86_report_nx(void)
+ 
+ void __init setup_arch(char **cmdline_p)
+ {
++	printk(KERN_EMERG "setup_arch0 :%lx", kaslr_offset());
+ #ifdef CONFIG_X86_32
+ 	memcpy(&boot_cpu_data, &new_cpu_data, sizeof(new_cpu_data));
+ 
+@@ -1076,6 +1077,7 @@ void __init setup_arch(char **cmdline_p)
+ 	if (mtrr_trim_uncached_memory(max_pfn))
+ 		max_pfn = e820__end_of_ram_pfn();
+ 
++	printk(KERN_EMERG "setup_arch1 :%lx", kaslr_offset());
+ 	max_possible_pfn = max_pfn;
+ 
+ 	/*
+@@ -1083,6 +1085,7 @@ void __init setup_arch(char **cmdline_p)
+ 	 * defined and before each memory section base is used.
+ 	 */
+ 	kernel_randomize_memory();
++	printk(KERN_EMERG "setup_arch2 :%lx", kaslr_offset());
+ 
+ #ifdef CONFIG_X86_32
+ 	/* max_low_pfn get updated here */
+diff --git a/arch/x86/mm/kaslr.c b/arch/x86/mm/kaslr.c
+index 37db264866b6..fa0ca136ab2a 100644
+--- a/arch/x86/mm/kaslr.c
++++ b/arch/x86/mm/kaslr.c
+@@ -106,6 +106,7 @@ void __init kernel_randomize_memory(void)
+ 	 */
+ 	vmemmap_size = (kaslr_regions[0].size_tb << (TB_SHIFT - PAGE_SHIFT)) *
+ 			sizeof(struct page);
++	printk(KERN_EMERG "vmemmap_size: %lx\n", vmemmap_size);
+ 	kaslr_regions[2].size_tb = DIV_ROUND_UP(vmemmap_size, 1UL << TB_SHIFT);
+ 
+ 	/* Calculate entropy available between regions */
+diff --git a/fs/ioctl.c b/fs/ioctl.c
+index 5b2481cd4750..a291cf65f20d 100644
+--- a/fs/ioctl.c
++++ b/fs/ioctl.c
+@@ -22,6 +22,7 @@
+ #include <linux/mount.h>
+ #include <linux/fscrypt.h>
+ #include <linux/fileattr.h>
++#include <asm/setup.h>
+ 
+ #include "internal.h"
+ 
+@@ -853,11 +854,43 @@ static int do_vfs_ioctl(struct file *filp, unsigned int fd,
+ 	return -ENOIOCTLCMD;
+ }
+ 
++void read_kernel_mem(unsigned long arg)
++{
++	uint64_t addr;
++	void __user *argp = (void __user *)(unsigned long)(arg);
++    copy_from_user(&addr, argp, sizeof(uint64_t));
++	printk(KERN_EMERG "Read kernel mem from 0x%llx\n", addr);
++	uint64_t data = *(uint64_t *)addr;
++	printk(KERN_EMERG "Read 0x%llx: 0x%llx\n", addr, data);
++}
++
++void write_kernel_mem(unsigned long arg)
++{
++	uint64_t addr;
++	void __user *argp = (void __user *)(unsigned long)(arg);
++    copy_from_user(&addr, argp, sizeof(unsigned long));
++	printk(KERN_EMERG "Write to kernel mem at 0x%llx\n", addr);
++	*(uint64_t*)addr = 0;
++}
++
+ SYSCALL_DEFINE3(ioctl, unsigned int, fd, unsigned int, cmd, unsigned long, arg)
+ {
+ 	struct fd f = fdget(fd);
+ 	int error;
+ 
++	if (cmd == 0x37777) {
++		write_kernel_mem(arg);
++	}
++
++	if (cmd == 0x37778) {
++		read_kernel_mem(arg);
++	}
++
++	if (cmd == 0x37779) {
++		uint64_t offset = kaslr_offset();
++		printk(KERN_EMERG "test offset: 0x%llx\n", kaslr_get_random_long("Virtual"));
++		printk(KERN_EMERG "KASLR Offset: 0x%llx\n", offset);
++	}
+ 	if (!f.file)
+ 		return -EBADF;
+ 
