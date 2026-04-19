@@ -1,0 +1,1392 @@
+From b1736517ae9f56b7ef37e453f48c177b2b96d6cb Mon Sep 17 00:00:00 2001
+From: ETenal <etenal@etenal.me>
+Date: Sun, 19 Apr 2026 07:36:54 -0700
+Subject: [PATCH 1/2] Add tracefs object watcher scripts and profiles
+
+This commit introduces a new set of scripts for tracing object lifecycles using tracefs. The main script, `tracefs-object-watch.sh`, provides a command-line interface for starting, stopping, and running tracing sessions with various profiles.
+
+Additionally, it includes:
+- A library file `lib.sh` with utility functions for managing trace events.
+- Profiles for cache-backed objects and request sockets, allowing users to monitor specific events related to memory allocation and deallocation.
+- A control header file `poc_control.h` for sending commands to the tracing process.
+
+These additions enhance the tracing capabilities of the kernel, enabling more detailed monitoring of object lifecycles in memory management.
+
+Signed-off-by: [Your Name] <your.email@example.com>
+---
+ scripts/tracing/object-watch/lib.sh           | 217 ++++++++++
+ scripts/tracing/object-watch/poc_control.h    |  83 ++++
+ .../tracing/object-watch/profiles/cache.sh    |  58 +++
+ .../object-watch/profiles/request_sock.sh     |  97 +++++
+ scripts/tracing/tracefs-object-watch.sh       | 397 ++++++++++++++++++
+ 5 files changed, 852 insertions(+)
+ create mode 100644 scripts/tracing/object-watch/lib.sh
+ create mode 100644 scripts/tracing/object-watch/poc_control.h
+ create mode 100644 scripts/tracing/object-watch/profiles/cache.sh
+ create mode 100644 scripts/tracing/object-watch/profiles/request_sock.sh
+ create mode 100755 scripts/tracing/tracefs-object-watch.sh
+
+diff --git a/scripts/tracing/object-watch/lib.sh b/scripts/tracing/object-watch/lib.sh
+new file mode 100644
+index 000000000000..52df1f186d33
+--- /dev/null
++++ b/scripts/tracing/object-watch/lib.sh
+@@ -0,0 +1,217 @@
++#!/bin/bash
++# SPDX-License-Identifier: GPL-2.0
++
++FRAMEWORK_EVENT_NAMES=(
++	cache_alloc
++	cache_free
++	reqsk_alloc_entry
++	reqsk_alloc_exit
++	cookie_reqsk_alloc_entry
++	cookie_reqsk_alloc_exit
++	reqsk_clone_entry
++	reqsk_clone_exit
++)
++
++CONTROL_ENV_VAR=TRACEFS_OBJWATCH_CTL
++
++log() {
++	echo "[tracefs-object-watch] $*" >&2
++}
++
++die() {
++	log "$*"
++	exit 1
++}
++
++require_root() {
++	if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
++		die "run as root"
++	fi
++}
++
++instance_dir() {
++	echo "$TRACEFS/instances/$INSTANCE"
++}
++
++instance_path() {
++	local rel="$1"
++	echo "$(instance_dir)/$rel"
++}
++
++have_btf() {
++	[[ -e /sys/kernel/btf/vmlinux ]]
++}
++
++event_enable_path() {
++	local event="$1"
++	echo "$(instance_dir)/events/$GROUP/$event/enable"
++}
++
++event_filter_path() {
++	local event="$1"
++	echo "$(instance_dir)/events/$GROUP/$event/filter"
++}
++
++write_if_exists() {
++	local path="$1"
++	local value="$2"
++
++	if [[ -e "$path" ]]; then
++		printf '%s\n' "$value" >"$path"
++	fi
++}
++
++instance_write_if_exists() {
++	local rel="$1"
++	local value="$2"
++
++	write_if_exists "$(instance_path "$rel")" "$value"
++}
++
++remove_dynamic_event() {
++	local name="$1"
++	printf '%s\n' "-:$GROUP/$name" >>"$TRACEFS/dynamic_events" 2>/dev/null || true
++}
++
++cleanup_framework_dynamic_events() {
++	local event
++
++	for event in "${FRAMEWORK_EVENT_NAMES[@]}"; do
++		remove_dynamic_event "$event"
++	done
++}
++
++add_dynamic_event() {
++	local definition="$1"
++	printf '%s\n' "$definition" >>"$TRACEFS/dynamic_events"
++}
++
++register_event() {
++	local name="$1"
++	local definition="$2"
++
++	add_dynamic_event "$definition"
++	ACTIVE_EVENTS+=("$name")
++}
++
++try_register_event() {
++	local name="$1"
++	local definition="$2"
++
++	if ! printf '%s\n' "$definition" >>"$TRACEFS/dynamic_events" 2>/dev/null; then
++		log "skipping unsupported probe: $definition"
++		return 1
++	fi
++
++	ACTIVE_EVENTS+=("$name")
++	return 0
++}
++
++set_event_filter() {
++	local event="$1"
++	local expr="$2"
++
++	if [[ -n "$expr" ]]; then
++		write_if_exists "$(event_filter_path "$event")" "$expr"
++	fi
++}
++
++enable_events() {
++	local event
++
++	for event in "$@"; do
++		write_if_exists "$(event_enable_path "$event")" 1
++	done
++}
++
++set_tracing_on() {
++	instance_write_if_exists tracing_on "$1"
++}
++
++clear_trace_buffer() {
++	: >"$(instance_path trace)"
++}
++
++set_instance_option() {
++	local name="$1"
++	local value="$2"
++	local option_path
++
++	option_path="$(instance_path "options/$name")"
++	if [[ -e "$option_path" ]]; then
++		printf '%s\n' "$value" >"$option_path"
++	elif [[ "$value" == "1" ]]; then
++		instance_write_if_exists trace_options "$name"
++	else
++		instance_write_if_exists trace_options "no$name"
++	fi
++}
++
++set_event_pid() {
++	instance_write_if_exists set_event_pid "$1"
++}
++
++clear_event_pid() {
++	: >"$(instance_path set_event_pid)"
++}
++
++write_trace_marker() {
++	local message="$1"
++	instance_write_if_exists trace_marker "$message"
++}
++
++append_filter_clause() {
++	local current="$1"
++	local clause="$2"
++
++	if [[ -z "$clause" ]]; then
++		printf '%s' "$current"
++		return
++	fi
++
++	if [[ -n "$current" ]]; then
++		printf '%s && %s' "$current" "$clause"
++	else
++		printf '%s' "$clause"
++	fi
++}
++
++compose_pid_filter() {
++	if [[ -n "${PID_FILTER:-}" ]]; then
++		printf 'common_pid == %s' "$PID_FILTER"
++	fi
++}
++
++compose_cache_filter() {
++	local expr
++
++	expr=$(compose_pid_filter)
++	if [[ -n "${TARGET_CACHE_GLOB:-}" ]]; then
++		expr=$(append_filter_clause "$expr" "cache ~ \"$TARGET_CACHE_GLOB\"")
++	fi
++
++	printf '%s' "$expr"
++}
++
++require_btf_or_die() {
++	if ! have_btf; then
++		die "BTF data not found at /sys/kernel/btf/vmlinux"
++	fi
++}
++
++install_cache_tracepoint_events() {
++	require_btf_or_die
++
++	register_event cache_alloc \
++		"t:$GROUP/cache_alloc kmem_cache_alloc obj=ptr cache=s->name:string call_site=call_site:symstr bytes_req=s->object_size:u64 bytes_alloc=s->size:u64 gfp=gfp_flags:x64 node=node:s32"
++	register_event cache_free \
++		"t:$GROUP/cache_free kmem_cache_free obj=ptr cache=s->name:string call_site=call_site:symstr"
++}
++
++apply_cache_tracepoint_filters() {
++	local cache_filter
++
++	cache_filter=$(compose_cache_filter)
++	set_event_filter cache_alloc "$cache_filter"
++	set_event_filter cache_free "$cache_filter"
++}
+diff --git a/scripts/tracing/object-watch/poc_control.h b/scripts/tracing/object-watch/poc_control.h
+new file mode 100644
+index 000000000000..a6473c62c941
+--- /dev/null
++++ b/scripts/tracing/object-watch/poc_control.h
+@@ -0,0 +1,83 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef TRACEFS_OBJECT_WATCH_POC_CONTROL_H
++#define TRACEFS_OBJECT_WATCH_POC_CONTROL_H
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdarg.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#ifndef TRACEFS_OBJWATCH_CTL_ENV
++#define TRACEFS_OBJWATCH_CTL_ENV "TRACEFS_OBJWATCH_CTL"
++#endif
++
++static inline int objwatch_send_command(const char *fmt, ...)
++{
++	const char *path = getenv(TRACEFS_OBJWATCH_CTL_ENV);
++	char buf[512];
++	va_list ap;
++	int fd, len;
++
++	if (!path || !*path)
++		return -ENODEV;
++
++	va_start(ap, fmt);
++	len = vsnprintf(buf, sizeof(buf), fmt, ap);
++	va_end(ap);
++	if (len < 0)
++		return -EINVAL;
++	if ((size_t)len >= sizeof(buf))
++		return -E2BIG;
++
++	fd = open(path, O_WRONLY | O_CLOEXEC);
++	if (fd < 0)
++		return -errno;
++
++	if (write(fd, buf, len) != len) {
++		int saved = errno ? -errno : -EIO;
++		close(fd);
++		return saved;
++	}
++
++	close(fd);
++	return 0;
++}
++
++static inline int objwatch_begin(const char *tag)
++{
++	if (tag && *tag)
++		return objwatch_send_command("begin %s\n", tag);
++	return objwatch_send_command("begin\n");
++}
++
++static inline int objwatch_end(const char *tag)
++{
++	if (tag && *tag)
++		return objwatch_send_command("end %s\n", tag);
++	return objwatch_send_command("end\n");
++}
++
++static inline int objwatch_mark(const char *tag)
++{
++	if (tag && *tag)
++		return objwatch_send_command("mark %s\n", tag);
++	return objwatch_send_command("mark\n");
++}
++
++static inline int objwatch_clear(void)
++{
++	return objwatch_send_command("clear\n");
++}
++
++static inline bool objwatch_available(void)
++{
++	const char *path = getenv(TRACEFS_OBJWATCH_CTL_ENV);
++
++	return path && *path;
++}
++
++#endif /* TRACEFS_OBJECT_WATCH_POC_CONTROL_H */
+diff --git a/scripts/tracing/object-watch/profiles/cache.sh b/scripts/tracing/object-watch/profiles/cache.sh
+new file mode 100644
+index 000000000000..b1fa46720708
+--- /dev/null
++++ b/scripts/tracing/object-watch/profiles/cache.sh
+@@ -0,0 +1,58 @@
++#!/bin/bash
++# SPDX-License-Identifier: GPL-2.0
++
++profile_init() {
++	:
++}
++
++profile_usage() {
++	cat <<'EOF'
++Profile: cache
++
++Purpose:
++  Watch cache-backed object lifecycles through kmem tracepoint probes.
++
++Required:
++  --cache <glob>        Cache-name glob, e.g. 'cred_jar' or 'request_sock*'.
++
++Uses:
++  - t: kmem_cache_alloc
++  - t: kmem_cache_free
++
++Output fields:
++  obj, cache, call_site, bytes_req, bytes_alloc, gfp, node
++
++Example:
++  sudo scripts/tracing/tracefs-object-watch.sh start \
++      --profile cache --pid 1234 --cache 'cred_jar'
++EOF
++}
++
++profile_parse_args() {
++	if [[ $# -gt 0 ]]; then
++		die "profile cache does not accept extra options: $*"
++	fi
++}
++
++profile_validate() {
++	if [[ -z "${TARGET_CACHE_GLOB:-}" ]]; then
++		die "--cache is required for profile cache"
++	fi
++
++	require_btf_or_die
++}
++
++profile_install() {
++	install_cache_tracepoint_events
++}
++
++profile_apply_filters() {
++	apply_cache_tracepoint_filters
++}
++
++profile_summary() {
++	log "cache filter: $TARGET_CACHE_GLOB"
++	if [[ -n "${PID_FILTER:-}" ]]; then
++		log "pid filter: $PID_FILTER"
++	fi
++}
+diff --git a/scripts/tracing/object-watch/profiles/request_sock.sh b/scripts/tracing/object-watch/profiles/request_sock.sh
+new file mode 100644
+index 000000000000..9171f2e40207
+--- /dev/null
++++ b/scripts/tracing/object-watch/profiles/request_sock.sh
+@@ -0,0 +1,97 @@
++#!/bin/bash
++# SPDX-License-Identifier: GPL-2.0
++
++profile_init() {
++	if [[ -z "${TARGET_CACHE_GLOB:-}" ]]; then
++		TARGET_CACHE_GLOB='request_sock*'
++	fi
++}
++
++profile_usage() {
++	cat <<'EOF'
++Profile: request_sock
++
++Purpose:
++  Trace request_sock allocation, clone, and free activity while keeping the
++  framework generic. This profile builds on the generic cache watcher and adds
++  request_sock wrapper probes where the symbols are available.
++
++Optional:
++  --cache <glob>        Override the cache glob. Default: 'request_sock*'.
++
++Uses:
++  - Generic cache lifecycle events:
++      t: kmem_cache_alloc
++      t: kmem_cache_free
++  - request_sock wrapper probes:
++      f: inet_reqsk_alloc
++      f: cookie_tcp_reqsk_alloc
++      f: inet_reqsk_clone   (best effort; static symbol visibility varies)
++
++Notes:
++  - Frees fall back to kmem_cache_free filtered by request_sock cache name.
++  - This avoids baking __reqsk_free into the framework core.
++
++Example:
++  sudo scripts/tracing/tracefs-object-watch.sh start \
++      --profile request_sock --pid 1234
++EOF
++}
++
++profile_parse_args() {
++	if [[ $# -gt 0 ]]; then
++		die "profile request_sock does not accept extra options: $*"
++	fi
++}
++
++profile_validate() {
++	require_btf_or_die
++}
++
++profile_install() {
++	install_cache_tracepoint_events
++
++	register_event reqsk_alloc_entry \
++		"f:$GROUP/reqsk_alloc_entry inet_reqsk_alloc ops_name=ops->slab_name:string listener=sk_listener attach=attach_listener"
++	register_event reqsk_alloc_exit \
++		"f:$GROUP/reqsk_alloc_exit inet_reqsk_alloc%return req=\$retval"
++	register_event cookie_reqsk_alloc_entry \
++		"f:$GROUP/cookie_reqsk_alloc_entry cookie_tcp_reqsk_alloc ops_name=ops->slab_name:string sk=sk"
++	register_event cookie_reqsk_alloc_exit \
++		"f:$GROUP/cookie_reqsk_alloc_exit cookie_tcp_reqsk_alloc%return req=\$retval"
++
++	# inet_reqsk_clone() is static, so probe availability depends on the build.
++	try_register_event reqsk_clone_entry \
++		"f:$GROUP/reqsk_clone_entry inet_reqsk_clone req=req sk=sk"
++	try_register_event reqsk_clone_exit \
++		"f:$GROUP/reqsk_clone_exit inet_reqsk_clone%return nreq=\$retval"
++}
++
++profile_apply_filters() {
++	local pid_filter wrapper_filter
++
++	apply_cache_tracepoint_filters
++
++	pid_filter=$(compose_pid_filter)
++	wrapper_filter="$pid_filter"
++
++	if [[ -n "$TARGET_CACHE_GLOB" ]]; then
++		wrapper_filter=$(append_filter_clause "$wrapper_filter" \
++			"ops_name ~ \"$TARGET_CACHE_GLOB\"")
++	fi
++
++	set_event_filter reqsk_alloc_entry "$wrapper_filter"
++	set_event_filter cookie_reqsk_alloc_entry "$wrapper_filter"
++	set_event_filter reqsk_alloc_exit "$pid_filter"
++	set_event_filter cookie_reqsk_alloc_exit "$pid_filter"
++	set_event_filter reqsk_clone_entry "$pid_filter"
++	set_event_filter reqsk_clone_exit "$pid_filter"
++}
++
++profile_summary() {
++	log "cache filter: $TARGET_CACHE_GLOB"
++	if [[ -n "${PID_FILTER:-}" ]]; then
++		log "pid filter: $PID_FILTER"
++	fi
++	log "free tracking: kmem_cache_free filtered by request_sock cache"
++}
+diff --git a/scripts/tracing/tracefs-object-watch.sh b/scripts/tracing/tracefs-object-watch.sh
+new file mode 100755
+index 000000000000..c2062883ac6e
+--- /dev/null
++++ b/scripts/tracing/tracefs-object-watch.sh
+@@ -0,0 +1,397 @@
++#!/bin/bash
++# SPDX-License-Identifier: GPL-2.0
++#
++# Generic tracefs object watcher with profile-based event sets.
++
++set -euo pipefail
++
++SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
++FRAMEWORK_DIR="$SCRIPT_DIR/object-watch"
++PROFILE_DIR="$FRAMEWORK_DIR/profiles"
++
++# shellcheck source=/dev/null
++source "$FRAMEWORK_DIR/lib.sh"
++
++TRACEFS=${TRACEFS:-/sys/kernel/tracing}
++INSTANCE=${INSTANCE:-objtrace}
++GROUP=${GROUP:-objtrace}
++BUFFER_KB=${BUFFER_KB:-8192}
++PID_FILTER=
++KEEP_INSTANCE=0
++PROFILE=cache
++TARGET_CACHE_GLOB=
++COMMAND=
++SHOW_PROFILE_HELP=0
++LIST_PROFILES=0
++PROFILE_ARGS=()
++ACTIVE_EVENTS=()
++RUN_ARGS=()
++RUN_AUTOSTART=0
++CONTROL_FIFO=
++RUN_CHILD_PID=
++
++usage() {
++	cat <<'EOF'
++Usage:
++  tracefs-object-watch.sh start [common options] [profile options]
++  tracefs-object-watch.sh stop [common options]
++  tracefs-object-watch.sh run [common options] [profile options] -- <command> [args...]
++
++Common options:
++  --profile <name>      Profile to load. Default: cache.
++  --reqsk               Alias for --profile request_sock.
++  --pid <pid>           Only keep events from this PID.
++  --cache <glob>        Shared cache glob for cache-backed profiles.
++  --instance <name>     tracefs instance name. Default: objtrace.
++  --tracefs <path>      tracefs mount. Default: /sys/kernel/tracing.
++  --buffer-kb <size>    Instance buffer size in KB. Default: 8192.
++  --keep-instance       On stop, leave the tracefs instance directory in place.
++  --autostart           In run mode, start tracing immediately after exec.
++  --profile-help        Show help for the selected profile.
++  --list-profiles       List available profiles.
++  -h, --help            Show this help.
++
++Profiles:
++  cache                 Generic cache-backed object lifecycle watcher.
++  request_sock          request_sock lifecycle watcher with wrapper probes.
++
++Examples:
++  sudo scripts/tracing/tracefs-object-watch.sh start \
++      --profile cache --pid 1234 --cache 'cred_jar'
++
++  sudo scripts/tracing/tracefs-object-watch.sh start \
++      --profile request_sock --pid 1234
++
++  sudo scripts/tracing/tracefs-object-watch.sh run \
++      --profile request_sock -- ./fast_poc
++
++  sudo cat /sys/kernel/tracing/instances/objtrace/trace_pipe
++  sudo scripts/tracing/tracefs-object-watch.sh stop
++EOF
++}
++
++list_profiles() {
++	cat <<'EOF'
++cache
++  Generic cache-backed lifecycle tracing via kmem tracepoint probes.
++
++request_sock
++  request_sock-specific lifecycle tracing layered on the generic cache watcher.
++EOF
++}
++
++load_profile() {
++	local profile_path="$PROFILE_DIR/$PROFILE.sh"
++
++	[[ -e "$profile_path" ]] || die "unknown profile: $PROFILE"
++	# shellcheck source=/dev/null
++	source "$profile_path"
++	profile_init
++}
++
++parse_args() {
++	local cmd="${1:-}"
++	shift || true
++
++	case "$cmd" in
++	start|stop|run)
++		COMMAND="$cmd"
++		;;
++	-h|--help|"")
++		usage
++		exit 0
++		;;
++	*)
++		die "unknown command: $cmd"
++		;;
++	esac
++
++	while [[ $# -gt 0 ]]; do
++		case "$1" in
++		--)
++			shift
++			RUN_ARGS=("$@")
++			break
++			;;
++		--profile)
++			PROFILE="${2:?missing value for --profile}"
++			shift 2
++			;;
++		--reqsk)
++			PROFILE=request_sock
++			shift
++			;;
++		--pid)
++			PID_FILTER="${2:?missing value for --pid}"
++			shift 2
++			;;
++		--cache)
++			TARGET_CACHE_GLOB="${2:?missing value for --cache}"
++			shift 2
++			;;
++		--instance)
++			INSTANCE="${2:?missing value for --instance}"
++			shift 2
++			;;
++		--tracefs)
++			TRACEFS="${2:?missing value for --tracefs}"
++			shift 2
++			;;
++		--buffer-kb)
++			BUFFER_KB="${2:?missing value for --buffer-kb}"
++			shift 2
++			;;
++		--keep-instance)
++			KEEP_INSTANCE=1
++			shift
++			;;
++		--autostart)
++			RUN_AUTOSTART=1
++			shift
++			;;
++		--profile-help)
++			SHOW_PROFILE_HELP=1
++			shift
++			;;
++		--list-profiles)
++			LIST_PROFILES=1
++			shift
++			;;
++		-h|--help)
++			usage
++			exit 0
++			;;
++		*)
++			PROFILE_ARGS+=("$1")
++			shift
++			;;
++		esac
++	done
++}
++
++enable_active_events() {
++	enable_events "${ACTIVE_EVENTS[@]}"
++}
++
++configure_instance() {
++	local inst
++
++	inst=$(instance_dir)
++	mkdir -p "$inst"
++	printf '0\n' >"$inst/tracing_on"
++	write_if_exists "$inst/events/enable" 0
++	printf '%s\n' "$BUFFER_KB" >"$inst/buffer_size_kb"
++	: >"$inst/trace"
++}
++
++prepare_profile() {
++	configure_instance
++	cleanup_framework_dynamic_events
++	profile_parse_args "${PROFILE_ARGS[@]}"
++	profile_validate
++	profile_install
++	profile_apply_filters
++	enable_active_events
++}
++
++start_tracing() {
++	prepare_profile
++	write_if_exists "$(instance_dir)/tracing_on" 1
++
++	log "profile: $PROFILE"
++	log "instance: $(instance_dir)"
++	log "read live events with: cat $(instance_dir)/trace_pipe"
++	profile_summary
++}
++
++print_run_integration_help() {
++	cat >&2 <<EOF
++[tracefs-object-watch] run mode control FIFO exported as:
++[tracefs-object-watch]   $CONTROL_ENV_VAR=$CONTROL_FIFO
++[tracefs-object-watch] POC may write commands:
++[tracefs-object-watch]   begin [tag]  - clear trace buffer and enable tracing
++[tracefs-object-watch]   end [tag]    - write end marker and disable tracing
++[tracefs-object-watch]   mark <text>  - add a trace marker
++EOF
++}
++
++wait_for_stopped_child() {
++	local state=
++
++	while kill -0 "$RUN_CHILD_PID" 2>/dev/null; do
++		state=$(awk '/^State:/ {print $2}' "/proc/$RUN_CHILD_PID/status" 2>/dev/null || true)
++		if [[ "$state" == "T" ]]; then
++			return 0
++		fi
++		sleep 0.01
++	done
++
++	die "failed to stop wrapped child before tracing setup"
++}
++
++spawn_wrapped_child() {
++	CONTROL_FIFO=$(mktemp -u "/tmp/tracefs-object-watch.${INSTANCE}.XXXXXX")
++	mkfifo "$CONTROL_FIFO"
++	chmod 0666 "$CONTROL_FIFO"
++
++	env "$CONTROL_ENV_VAR=$CONTROL_FIFO" \
++		bash -c 'kill -STOP $$; exec "$@"' _ "${RUN_ARGS[@]}" &
++	RUN_CHILD_PID=$!
++	wait_for_stopped_child
++}
++
++handle_control_command() {
++	local line="$1"
++	local cmd arg
++
++	cmd=${line%% *}
++	if [[ "$cmd" == "$line" ]]; then
++		arg=
++	else
++		arg=${line#* }
++	fi
++
++	case "$cmd" in
++	begin|on|start)
++		clear_trace_buffer
++		if [[ -n "$arg" ]]; then
++			write_trace_marker "objwatch begin: $arg"
++		else
++			write_trace_marker "objwatch begin"
++		fi
++		set_tracing_on 1
++		;;
++	end|off|stop)
++		if [[ -n "$arg" ]]; then
++			write_trace_marker "objwatch end: $arg"
++		else
++			write_trace_marker "objwatch end"
++		fi
++		set_tracing_on 0
++		;;
++	mark)
++		write_trace_marker "objwatch mark: ${arg:-unnamed}"
++		;;
++	clear)
++		clear_trace_buffer
++		;;
++	"")
++		;;
++	*)
++		log "ignoring unknown control command: $line"
++		;;
++	esac
++}
++
++control_loop() {
++	local line=
++
++	exec 3<>"$CONTROL_FIFO"
++	while :; do
++		if IFS= read -r -t 0.2 line <&3; then
++			handle_control_command "$line"
++		elif ! kill -0 "$RUN_CHILD_PID" 2>/dev/null; then
++			break
++		fi
++	done
++	exec 3>&-
++}
++
++configure_run_descendant_capture() {
++	if [[ -n "$PID_FILTER" ]]; then
++		die "--pid is not supported with run mode; wrapper mode manages descendant tasks automatically"
++	fi
++
++	set_instance_option event-fork 1
++	set_instance_option markers 1
++	clear_event_pid
++	set_event_pid "$RUN_CHILD_PID"
++}
++
++run_tracing() {
++	local status ctl_pid
++
++	[[ ${#RUN_ARGS[@]} -gt 0 ]] || die "run requires a command after --"
++
++	prepare_profile
++	spawn_wrapped_child
++	configure_run_descendant_capture
++
++	if [[ "$RUN_AUTOSTART" -eq 1 ]]; then
++		clear_trace_buffer
++		write_trace_marker "objwatch autostart"
++		set_tracing_on 1
++	else
++		set_tracing_on 0
++	fi
++
++	print_run_integration_help
++
++	control_loop &
++	ctl_pid=$!
++
++	kill -CONT "$RUN_CHILD_PID"
++	set +e
++	wait "$RUN_CHILD_PID"
++	status=$?
++	set -e
++
++	wait "$ctl_pid" || true
++	rm -f "$CONTROL_FIFO"
++	CONTROL_FIFO=
++	stop_tracing
++	return "$status"
++}
++
++stop_tracing() {
++	local inst
++
++	inst=$(instance_dir)
++	if [[ -d "$inst" ]]; then
++		write_if_exists "$inst/tracing_on" 0
++		write_if_exists "$inst/events/enable" 0
++		: >"$inst/trace" || true
++		: >"$inst/set_event_pid" 2>/dev/null || true
++	fi
++
++	cleanup_framework_dynamic_events
++
++	if [[ -d "$inst" && "$KEEP_INSTANCE" -eq 0 ]]; then
++		rmdir "$inst" 2>/dev/null || \
++			log "could not remove $inst (is trace_pipe or trace still open?)"
++	fi
++}
++
++main() {
++	parse_args "$@"
++
++	if [[ "$LIST_PROFILES" -eq 1 ]]; then
++		list_profiles
++		exit 0
++	fi
++
++	load_profile
++
++	if [[ "$SHOW_PROFILE_HELP" -eq 1 ]]; then
++		profile_usage
++		exit 0
++	fi
++
++	require_root
++	[[ -d "$TRACEFS" ]] || die "tracefs directory not found: $TRACEFS"
++	[[ -e "$TRACEFS/dynamic_events" ]] || die "dynamic_events not available under $TRACEFS"
++
++	case "$COMMAND" in
++	start)
++		start_tracing
++		;;
++	stop)
++		stop_tracing
++		;;
++	run)
++		run_tracing
++		;;
++	esac
++}
++
++main "$@"
+-- 
+2.47.3
+
+
+From cb5cf3dda6f21b4b62388946a2a7d6310e0a0f68 Mon Sep 17 00:00:00 2001
+From: ETenal <etenal@etenal.me>
+Date: Sun, 19 Apr 2026 07:41:49 -0700
+Subject: [PATCH 2/2] Add README for tracefs object watcher framework
+
+This commit introduces a comprehensive README file for the tracefs object watcher framework, detailing its purpose, directory layout, high-level design, and usage instructions. The document outlines the framework's capabilities for tracing object lifecycles and specific events, as well as providing guidance on adding new object watchers and integrating with proof-of-concept applications.
+
+Key sections include:
+- Overview of the framework's functionality and intended use cases.
+- Description of the core runner and profile structure.
+- Instructions for common commands and wrapper mode semantics.
+- Guidelines for extending the framework and adding new profiles.
+
+This documentation enhances user understanding and facilitates effective utilization of the tracing capabilities.
+
+Signed-off-by: [Your Name] <your.email@example.com>
+---
+ scripts/tracing/README.md | 448 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 448 insertions(+)
+ create mode 100644 scripts/tracing/README.md
+
+diff --git a/scripts/tracing/README.md b/scripts/tracing/README.md
+new file mode 100644
+index 000000000000..e2315a37161c
+--- /dev/null
++++ b/scripts/tracing/README.md
+@@ -0,0 +1,448 @@
++# Tracefs Object Watch
++
++This directory contains a small, profile-based tracing framework built on top of
++`tracefs` dynamic events. Its goal is to trace object lifecycles and bug-specific
++events without adding new kernel instrumentation for every debugging task.
++
++The main entrypoint is `scripts/tracing/tracefs-object-watch.sh`.
++
++## What This Framework Is For
++
++Use this framework when you want to:
++
++- trace allocation and free activity for one object family
++- limit tracing to one target process tree
++- integrate tracing with a proof-of-concept (POC) in C
++- keep setup noise out of the trace by enabling tracing only around the bug window
++- add new object watchers without rewriting the whole tracing script
++
++Use this framework before adding ad hoc kernel `printk()` hooks.
++
++## Directory Layout
++
++```text
++scripts/tracing/
++  tracefs-object-watch.sh          # runner / wrapper / lifecycle management
++  README.md                        # this document
++  object-watch/
++    lib.sh                         # shared helpers
++    poc_control.h                  # C helper for begin/end/mark control
++    profiles/
++      cache.sh                     # generic cache-backed watcher
++      request_sock.sh              # request_sock specialization
++```
++
++## High-Level Design
++
++There are two layers:
++
++1. Core runner: `tracefs-object-watch.sh`
++2. Profiles: `object-watch/profiles/*.sh`
++
++The runner knows how to:
++
++- create and clean up a tracefs instance
++- register dynamic events
++- enable and filter those events
++- run a target program under tracing
++- capture descendant tasks in wrapper mode
++- receive begin/end/mark commands from the POC
++
++A profile knows:
++
++- which events define the object lifecycle
++- which fields should be fetched from those events
++- which filters should be applied
++- which object-specific fallbacks are acceptable
++
++This split is important. Keep the runner generic. Put object-specific logic in
++profiles.
++
++## Current Profiles
++
++### `cache`
++
++Generic watcher for cache-backed objects using the built-in `kmem` tracepoints.
++
++It traces:
++
++- `kmem_cache_alloc`
++- `kmem_cache_free`
++
++It requires BTF because it fetches `s->name` to identify the cache name.
++
++Typical use:
++
++```bash
++sudo scripts/tracing/tracefs-object-watch.sh start \
++  --profile cache \
++  --pid 1234 \
++  --cache 'cred_jar'
++```
++
++### `request_sock`
++
++Specialization for `request_sock` debugging.
++
++It builds on the generic cache watcher and adds wrapper probes such as:
++
++- `inet_reqsk_alloc`
++- `cookie_tcp_reqsk_alloc`
++- `inet_reqsk_clone` when available
++
++Important design detail:
++
++- free tracking does **not** depend on `__reqsk_free()`
++- instead, free tracking falls back to `kmem_cache_free` filtered by
++  `request_sock*`
++
++This is the correct shape for the framework. `__reqsk_free()` is a special case,
++not a core framework abstraction.
++
++## Common Commands
++
++### Static start/stop mode
++
++Use this when you already know the target PID and do not need wrapper mode.
++
++```bash
++sudo scripts/tracing/tracefs-object-watch.sh start \
++  --profile request_sock \
++  --pid 1234
++
++sudo cat /sys/kernel/tracing/instances/objtrace/trace_pipe
++
++sudo scripts/tracing/tracefs-object-watch.sh stop
++```
++
++### Wrapper mode
++
++Use this when the framework should launch the POC itself.
++
++```bash
++sudo scripts/tracing/tracefs-object-watch.sh run \
++  --profile request_sock \
++  -- ./fast_poc
++```
++
++This is the preferred mode for exploit debugging because it avoids manual PID
++handling and supports descendant capture.
++
++### Discoverability
++
++```bash
++scripts/tracing/tracefs-object-watch.sh --help
++scripts/tracing/tracefs-object-watch.sh start --list-profiles
++scripts/tracing/tracefs-object-watch.sh start --profile request_sock --profile-help
++```
++
++## Wrapper Mode Semantics
++
++Wrapper mode exists because a plain tracefs setup cannot automatically know which
++PID you care about. The runner solves that by launching the POC itself.
++
++The flow is:
++
++1. Create tracefs instance
++2. Install profile events and filters
++3. Spawn the target child in a stopped state
++4. Enroll the child into `set_event_pid`
++5. Enable `event-fork`
++6. Resume the child
++7. Let the POC toggle tracing with a FIFO control channel
++
++### Threads and child processes
++
++In `run` mode, the runner does **not** use `common_pid == X`.
++
++Instead it uses:
++
++- `set_event_pid`
++- `event-fork`
++
++This means the trace follows the wrapped task tree:
++
++- the wrapped process
++- its threads
++- forked child processes
++- further descendants
++
++This is usually what you want for a multi-threaded or multi-process POC.
++
++This does **not** capture unrelated pre-existing processes.
++
++## POC Integration
++
++Wrapper mode exports a FIFO path in the environment variable:
++
++```text
++TRACEFS_OBJWATCH_CTL
++```
++
++The POC can use `object-watch/poc_control.h` to send control commands to the
++runner without writing to tracefs itself.
++
++Supported commands are:
++
++- `begin [tag]`
++- `end [tag]`
++- `mark <text>`
++- `clear`
++
++### Recommended bug-window pattern
++
++Most POCs have noisy setup that is unrelated to the actual trigger. The intended
++pattern is:
++
++1. run all setup logic with tracing disabled
++2. call `objwatch_begin()` immediately before the interesting path
++3. optionally call `objwatch_mark()` around key milestones
++4. call `objwatch_end()` when the bug window is over
++
++Example:
++
++```c
++#include "scripts/tracing/object-watch/poc_control.h"
++
++static void do_setup(void)
++{
++	/* setup noise */
++}
++
++static void trigger_bug(void)
++{
++	objwatch_begin("trigger");
++	objwatch_mark("about to send racing packet");
++	/* actual bug trigger */
++	objwatch_end("trigger");
++}
++
++int main(void)
++{
++	do_setup();
++	trigger_bug();
++	return 0;
++}
++```
++
++Current behavior:
++
++- `begin` clears the trace buffer, writes a marker, then enables tracing
++- `end` writes a marker, then disables tracing
++- `mark` adds a trace marker only
++
++If the POC is not running under wrapper mode, the helper returns `-ENODEV`.
++
++## Rules For Future LLMs
++
++If you are extending this framework, follow these rules:
++
++1. Do not put object-specific logic in `tracefs-object-watch.sh` unless it is
++   truly generic runner behavior.
++2. Prefer adding a new profile in `object-watch/profiles/`.
++3. Prefer built-in tracepoints first, then fprobes, then kprobes. Only add new
++   kernel tracepoints if tracefs cannot express the required event precisely.
++4. Do not assume inline helpers are probeable. Check whether the target is:
++   - out-of-line exported/global symbol
++   - static symbol with build-dependent visibility
++   - inline helper with no symbol at all
++5. If an exact free routine is not probeable, use a semantic fallback in the
++   profile instead of polluting the framework core.
++6. Keep profile fallbacks explicit in comments and README updates.
++7. Update this README when you add or change profiles.
++
++## How To Add A New Object Watcher
++
++### Step 1: Decide whether the object is cache-backed
++
++If the object lives in a dedicated `kmem_cache`, start from the `cache` profile
++pattern.
++
++Examples:
++
++- object allocated from `kmem_cache_alloc(cachep, ...)`
++- object freed by `kmem_cache_free(cachep, obj)`
++
++If the object is created by a higher-level wrapper, you can still use cache
++events for alloc/free and add function probes for extra semantics.
++
++### Step 2: Find candidate events
++
++Look for candidates in this order:
++
++1. existing tracepoints
++2. function entry/exit probes on stable wrappers
++3. kprobe/kretprobe on lower-level functions
++4. only if necessary: add a new kernel tracepoint
++
++Prefer events that already carry:
++
++- object pointer
++- cache pointer or cache name
++- size / flags / node
++- wrapper arguments useful for correlation
++
++### Step 3: Identify lifecycle boundaries
++
++For a new profile, define:
++
++- alloc events
++- free events
++- optional clone/migrate events
++- optional context-only events
++
++Be honest about what is exact and what is fallback-based.
++
++Example for `request_sock`:
++
++- alloc: exact wrapper return probes
++- free: fallback to `kmem_cache_free` on `request_sock*`
++
++### Step 4: Create a new profile file
++
++Add `scripts/tracing/object-watch/profiles/<name>.sh`.
++
++Each profile must define:
++
++- `profile_init`
++- `profile_usage`
++- `profile_parse_args`
++- `profile_validate`
++- `profile_install`
++- `profile_apply_filters`
++- `profile_summary`
++
++Use the helper functions from `object-watch/lib.sh` rather than directly writing
++to tracefs from the profile.
++
++### Step 5: Install events with the shared helpers
++
++Useful helpers from `lib.sh`:
++
++- `register_event <name> <dynamic-event-definition>`
++- `try_register_event <name> <dynamic-event-definition>`
++- `set_event_filter <event> <expr>`
++- `install_cache_tracepoint_events`
++- `apply_cache_tracepoint_filters`
++- `compose_pid_filter`
++- `compose_cache_filter`
++- `append_filter_clause`
++
++Use `try_register_event()` for symbols that may not exist in every build.
++
++### Step 6: Validate assumptions
++
++Before finalizing a profile, check:
++
++- whether BTF is required
++- whether the symbol is static or inline
++- whether the fetched fields are valid for the chosen event
++- whether wrapper mode or manual PID mode is the intended usage
++- whether multi-thread or multi-process descendants should be captured
++
++### Step 7: Document the profile
++
++At minimum:
++
++- add profile help text
++- update `list_profiles` in the runner
++- update this README
++- mention exact vs fallback lifecycle boundaries
++
++## Profile Template
++
++Use this as a starting point:
++
++```bash
++#!/bin/bash
++# SPDX-License-Identifier: GPL-2.0
++
++profile_init() {
++	if [[ -z "${TARGET_CACHE_GLOB:-}" ]]; then
++		TARGET_CACHE_GLOB='my_cache*'
++	fi
++}
++
++profile_usage() {
++	cat <<'EOF'
++Profile: my_object
++
++Purpose:
++  Trace my_object lifecycle.
++EOF
++}
++
++profile_parse_args() {
++	if [[ $# -gt 0 ]]; then
++		die "profile my_object does not accept extra options: $*"
++	fi
++}
++
++profile_validate() {
++	require_btf_or_die
++}
++
++profile_install() {
++	install_cache_tracepoint_events
++
++	register_event my_wrapper_entry \
++		"f:$GROUP/my_wrapper_entry my_alloc_wrapper arg1=foo"
++	register_event my_wrapper_exit \
++		"f:$GROUP/my_wrapper_exit my_alloc_wrapper%return obj=\$retval"
++}
++
++profile_apply_filters() {
++	local pid_filter
++
++	apply_cache_tracepoint_filters
++	pid_filter=$(compose_pid_filter)
++	set_event_filter my_wrapper_entry "$pid_filter"
++	set_event_filter my_wrapper_exit "$pid_filter"
++}
++
++profile_summary() {
++	log "cache filter: $TARGET_CACHE_GLOB"
++}
++```
++
++## Common Pitfalls
++
++### Inline helpers
++
++Do not design around inline helpers unless you are intentionally adding a real
++kernel tracepoint somewhere else.
++
++If the code lives in a header as `static inline`, it is usually the wrong probe
++anchor.
++
++### Static symbols
++
++A static function may or may not be probeable depending on the build and symbol
++visibility. Use `try_register_event()` for these.
++
++### BTF dependency
++
++This framework currently expects BTF for the useful profiles because it fetches
++fields such as `s->name` or `ops->slab_name`.
++
++Without BTF:
++
++- cache-name decoding will fail
++- many field-based fetch expressions will fail
++
++### Overfitting one bug
++
++Do not hardcode one bug's special cleanup path into the framework core.
++
++The framework should stay reusable. Put one-off semantics in profiles.
++
++## When To Add A Real Kernel Tracepoint
++
++Add a new kernel tracepoint only when all of the following are true:
++
++- tracefs dynamic events cannot observe the required lifecycle event precisely
++- a wrapper or fallback event loses important semantics
++- userspace correlation becomes unreliable or too fragile
++- the event is likely to be reused beyond one temporary debugging session
++
++Until then, prefer this framework.
+-- 
+2.47.3
+
